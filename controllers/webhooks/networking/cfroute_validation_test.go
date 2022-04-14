@@ -442,9 +442,7 @@ var _ = Describe("CF Route Validation", func() {
 		})
 
 		When("there is an issue decoding the request", func() {
-			var (
-				badRequestResponse admission.Response
-			)
+			var badRequestResponse admission.Response
 
 			JustBeforeEach(func() {
 				badRequest := admission.Request{

@@ -1,10 +1,13 @@
 package repositories
 
 import (
+	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
+	"time"
 
 	"code.cloudfoundry.org/cf-k8s-controllers/api/apierrors"
 	"code.cloudfoundry.org/cf-k8s-controllers/api/authorization"
@@ -90,7 +93,7 @@ func (r *PodRepo) ListPodStats(ctx context.Context, authInfo authorization.Info,
 	}
 	listOpts := &client.ListOptions{Namespace: message.Namespace, LabelSelector: labelSelector}
 
-	pods, err := r.listPods(ctx, authInfo, *listOpts)
+	pods, err := r.ListPods(ctx, authInfo, *listOpts)
 	if err != nil {
 		return nil, err
 	}
@@ -153,7 +156,7 @@ func (r *PodRepo) ListPodStats(ctx context.Context, authInfo authorization.Info,
 	return records, nil
 }
 
-func (r *PodRepo) listPods(ctx context.Context, authInfo authorization.Info, listOpts client.ListOptions) ([]corev1.Pod, error) {
+func (r *PodRepo) ListPods(ctx context.Context, authInfo authorization.Info, listOpts client.ListOptions) ([]corev1.Pod, error) {
 	userClient, err := r.userClientFactory.BuildClient(authInfo)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build user client: %w", err)
@@ -327,4 +330,78 @@ func aggregateContainerMetrics(containers []metricsv1beta1.ContainerMetrics) map
 	}
 
 	return metrics
+}
+
+type RuntimeLogsMessage struct {
+	SpaceGUID   string
+	AppGUID     string
+	AppRevision string
+	Limit       int64
+}
+
+func (r *PodRepo) GetRuntimeLogsForApp(ctx context.Context, authInfo authorization.Info, message RuntimeLogsMessage) ([]LogRecord, error) {
+	labelSelector, err := labels.ValidatedSelectorFromSet(map[string]string{
+		workloadsv1alpha1.CFAppGUIDLabelKey:  message.AppGUID,
+		"workloads.cloudfoundry.org/version": message.AppRevision,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to build labelSelector: %w", err)
+	}
+	listOpts := client.ListOptions{Namespace: message.SpaceGUID, LabelSelector: labelSelector}
+
+	pods, err := r.ListPods(ctx, authInfo, listOpts)
+	if err != nil {
+		return nil, err
+	}
+
+	appLogs := make([]LogRecord, 0, int64(len(pods))*message.Limit/2)
+
+	k8sClient, err := r.userClientFactory.BuildK8sClient(authInfo)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build user client: %w", err)
+	}
+
+	for _, pod := range pods {
+		var logReadCloser io.ReadCloser
+		logReadCloser, err = k8sClient.CoreV1().Pods(message.SpaceGUID).GetLogs(pod.Name, &corev1.PodLogOptions{Timestamps: true, TailLines: &message.Limit}).Stream(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch logs for pods: %w", apierrors.FromK8sError(err, ProcessStatsResourceType))
+		}
+
+		r := bufio.NewReader(logReadCloser)
+		for {
+			var line []byte
+			line, err = r.ReadBytes('\n')
+			if err != nil {
+				if err == io.EOF {
+					break
+				} else {
+					logReadCloser.Close()
+					return nil, fmt.Errorf("failed to parse pod logs: %w", err)
+				}
+			}
+
+			logLine := string(line)
+			var logTime time.Time
+			logTime, _ = parseRFC3339NanoTime(logLine)
+
+			logRecord := LogRecord{
+				Message:   string(line),
+				Timestamp: logTime.UnixNano(),
+			}
+
+			appLogs = append(appLogs, logRecord)
+		}
+
+		logReadCloser.Close()
+	}
+
+	return appLogs, nil
+}
+
+func parseRFC3339NanoTime(input string) (time.Time, error) {
+	if len(input) < 30 {
+		return time.Time{}, fmt.Errorf("string not long enough")
+	}
+	return time.Parse(time.RFC3339Nano, input[:30])
 }
