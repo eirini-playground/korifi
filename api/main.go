@@ -50,7 +50,6 @@ type APIHandler interface {
 }
 
 func main() {
-    some random crap
 	configPath, found := os.LookupEnv("APICONFIG")
 	if !found {
 		panic("APICONFIG must be set")
